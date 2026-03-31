@@ -1,0 +1,76 @@
+# templates/tf-plan.yml
+# Reusable template: terraform init → validate → plan
+# ─────────────────────────────────────────────────────────────────────────────
+parameters:
+  - name: environment
+    type: string
+  - name: backendKey
+    type: string
+  - name: serviceConn
+    type: string
+  - name: kvName
+    type: string
+
+steps:
+  - checkout: self
+
+  # ── Install Terraform ──────────────────────────────────────────────────────
+  - task: TerraformInstaller@1
+    displayName: "Install Terraform"
+    inputs:
+      terraformVersion: $(TF_VERSION)
+
+  # ── Fetch secrets from Key Vault ──────────────────────────────────────────
+  - task: AzureKeyVault@2
+    displayName: "Fetch secrets from Key Vault"
+    inputs:
+      azureSubscription: "${{ parameters.serviceConn }}"
+      KeyVaultName:       "${{ parameters.kvName }}"
+      SecretsFilter:      "subscription-id,tenant-id,apim-publisher-email"
+      RunAsPreJob:        false
+
+  # ── Terraform Init ────────────────────────────────────────────────────────
+  - task: TerraformTaskV4@4
+    displayName: "Terraform Init"
+    inputs:
+      provider:              "azurerm"
+      command:               "init"
+      workingDirectory:      $(TF_WORKING_DIR)
+      backendServiceArm:     "${{ parameters.serviceConn }}"
+      backendAzureRmResourceGroupName:  $(BACKEND_RG)
+      backendAzureRmStorageAccountName: $(BACKEND_SA)
+      backendAzureRmContainerName:      $(BACKEND_CONTAINER)
+      backendAzureRmKey:                "${{ parameters.backendKey }}"
+
+  # ── Terraform Validate ───────────────────────────────────────────────────
+  - task: TerraformTaskV4@4
+    displayName: "Terraform Validate"
+    inputs:
+      provider:         "azurerm"
+      command:          "validate"
+      workingDirectory: $(TF_WORKING_DIR)
+
+  # ── Terraform Plan ────────────────────────────────────────────────────────
+  - task: TerraformTaskV4@4
+    displayName: "Terraform Plan"
+    inputs:
+      provider:            "azurerm"
+      command:             "plan"
+      workingDirectory:    $(TF_WORKING_DIR)
+      environmentServiceNameAzureRM: "${{ parameters.serviceConn }}"
+      commandOptions: >-
+        -var="environment=${{ parameters.environment }}"
+        -var="subscription_id=$(subscription-id)"
+        -var="tenant_id=$(tenant-id)"
+        -var="apim_publisher_email=$(apim-publisher-email)"
+        -var-file="${{ parameters.environment }}.tfvars"
+        -out=$(Build.ArtifactStagingDirectory)/tfplan-${{ parameters.environment }}
+        -input=false
+        -detailed-exitcode
+
+  # ── Publish plan artifact ─────────────────────────────────────────────────
+  - task: PublishPipelineArtifact@1
+    displayName: "Publish Terraform Plan"
+    inputs:
+      targetPath: "$(Build.ArtifactStagingDirectory)/tfplan-${{ parameters.environment }}"
+      artifact:   "tfplan-${{ parameters.environment }}"

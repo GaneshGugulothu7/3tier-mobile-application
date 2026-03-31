@@ -1,0 +1,245 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# azure-pipelines.yml
+# Terraform CI/CD pipeline for multi-environment Azure deployments
+# Environments: dev → test → prod (each requires manual approval gate for apply)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+  paths:
+    include:
+      - infra/**
+
+pr:
+  branches:
+    include:
+      - main
+      - develop
+  paths:
+    include:
+      - infra/**
+
+# ─── Global variables ─────────────────────────────────────────────────────────
+variables:
+  - group: terraform-global          # Library group: TF_VERSION, ARM_TENANT_ID
+  - name: TF_VERSION
+    value: "1.7.5"
+  - name: TF_WORKING_DIR
+    value: "$(System.DefaultWorkingDirectory)/infra"
+  - name: BACKEND_RG
+    value: "rg-tfstate"
+  - name: BACKEND_SA
+    value: "stterraformstate001"
+  - name: BACKEND_CONTAINER
+    value: "tfstate"
+
+# ─── Stage template parameters ───────────────────────────────────────────────
+parameters:
+  - name: runProd
+    displayName: "Deploy to Production?"
+    type: boolean
+    default: false
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# STAGE 1 – CI  (validate + plan for all envs, no apply)
+# ═══════════════════════════════════════════════════════════════════════════════
+stages:
+  - stage: CI
+    displayName: "CI – Validate & Plan"
+    jobs:
+
+      # ── Lint / Security scan ──────────────────────────────────────────────
+      - job: Lint
+        displayName: "Lint & Security Scan"
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - checkout: self
+
+          - task: TerraformInstaller@1
+            displayName: "Install Terraform $(TF_VERSION)"
+            inputs:
+              terraformVersion: $(TF_VERSION)
+
+          - script: |
+              # Install tflint
+              curl -s https://raw.githubusercontent.com/terraform-linters/tflint/master/install_linux.sh | bash
+              cd $(TF_WORKING_DIR)
+              tflint --init
+              tflint --recursive
+            displayName: "TFLint"
+
+          - script: |
+              # Install checkov
+              pip3 install checkov --quiet
+              checkov -d $(TF_WORKING_DIR) \
+                --framework terraform \
+                --output cli \
+                --output junitxml \
+                --output-file-path console,$(Build.ArtifactStagingDirectory)/checkov-report.xml \
+                --soft-fail
+            displayName: "Checkov Security Scan"
+
+          - task: PublishTestResults@2
+            displayName: "Publish Checkov Results"
+            condition: always()
+            inputs:
+              testResultsFormat: "JUnit"
+              testResultsFiles: "$(Build.ArtifactStagingDirectory)/checkov-report.xml"
+              testRunTitle: "Checkov Security Scan"
+
+      # ── Plan: dev ─────────────────────────────────────────────────────────
+      - job: Plan_Dev
+        displayName: "Terraform Plan – dev"
+        dependsOn: Lint
+        pool:
+          vmImage: "ubuntu-latest"
+        variables:
+          - group: terraform-dev          # ARM_CLIENT_ID, ARM_CLIENT_SECRET, etc.
+          - name: TF_ENV
+            value: dev
+        steps:
+          - template: templates/tf-plan.yml
+            parameters:
+              environment:    $(TF_ENV)
+              backendKey:     "$(TF_ENV).terraform.tfstate"
+              serviceConn:    "sc-azure-dev"
+              kvName:         "kv-dev-myapp-xxxx"   # Key Vault with pipeline secrets
+
+      # ── Plan: test ────────────────────────────────────────────────────────
+      - job: Plan_Test
+        displayName: "Terraform Plan – test"
+        dependsOn: Lint
+        pool:
+          vmImage: "ubuntu-latest"
+        variables:
+          - group: terraform-test
+          - name: TF_ENV
+            value: test
+        steps:
+          - template: templates/tf-plan.yml
+            parameters:
+              environment:    $(TF_ENV)
+              backendKey:     "$(TF_ENV).terraform.tfstate"
+              serviceConn:    "sc-azure-test"
+              kvName:         "kv-test-myapp-xxxx"
+
+      # ── Plan: prod ────────────────────────────────────────────────────────
+      - job: Plan_Prod
+        displayName: "Terraform Plan – prod"
+        dependsOn: Lint
+        condition: eq('${{ parameters.runProd }}', true)
+        pool:
+          vmImage: "ubuntu-latest"
+        variables:
+          - group: terraform-prod
+          - name: TF_ENV
+            value: prod
+        steps:
+          - template: templates/tf-plan.yml
+            parameters:
+              environment:    $(TF_ENV)
+              backendKey:     "$(TF_ENV).terraform.tfstate"
+              serviceConn:    "sc-azure-prod"
+              kvName:         "kv-prod-myapp-xxxx"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# STAGE 2 – Deploy Dev (auto-apply on main branch)
+# ═══════════════════════════════════════════════════════════════════════════════
+  - stage: Deploy_Dev
+    displayName: "Deploy – dev"
+    dependsOn: CI
+    condition: |
+      and(
+        succeeded('CI'),
+        eq(variables['Build.SourceBranch'], 'refs/heads/main')
+      )
+    variables:
+      - group: terraform-dev
+      - name: TF_ENV
+        value: dev
+    jobs:
+      - deployment: Apply_Dev
+        displayName: "Terraform Apply – dev"
+        pool:
+          vmImage: "ubuntu-latest"
+        environment: "dev"             # Azure DevOps Environment (auto-approve)
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - template: templates/tf-apply.yml
+                  parameters:
+                    environment:    $(TF_ENV)
+                    backendKey:     "$(TF_ENV).terraform.tfstate"
+                    serviceConn:    "sc-azure-dev"
+                    kvName:         "kv-dev-myapp-xxxx"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# STAGE 3 – Deploy Test (manual approval gate)
+# ═══════════════════════════════════════════════════════════════════════════════
+  - stage: Deploy_Test
+    displayName: "Deploy – test"
+    dependsOn: Deploy_Dev
+    condition: succeeded('Deploy_Dev')
+    variables:
+      - group: terraform-test
+      - name: TF_ENV
+        value: test
+    jobs:
+      - deployment: Apply_Test
+        displayName: "Terraform Apply – test"
+        pool:
+          vmImage: "ubuntu-latest"
+        environment: "test"            # Azure DevOps Environment with approval check
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - template: templates/tf-apply.yml
+                  parameters:
+                    environment:    $(TF_ENV)
+                    backendKey:     "$(TF_ENV).terraform.tfstate"
+                    serviceConn:    "sc-azure-test"
+                    kvName:         "kv-test-myapp-xxxx"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# STAGE 4 – Deploy Prod (manual approval gate + runProd param)
+# ═══════════════════════════════════════════════════════════════════════════════
+  - stage: Deploy_Prod
+    displayName: "Deploy – prod"
+    dependsOn: Deploy_Test
+    condition: |
+      and(
+        succeeded('Deploy_Test'),
+        eq('${{ parameters.runProd }}', true)
+      )
+    variables:
+      - group: terraform-prod
+      - name: TF_ENV
+        value: prod
+    jobs:
+      - deployment: Apply_Prod
+        displayName: "Terraform Apply – prod"
+        pool:
+          vmImage: "ubuntu-latest"
+        environment: "prod"            # Azure DevOps Environment with approval check
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - template: templates/tf-apply.yml
+                  parameters:
+                    environment:    $(TF_ENV)
+                    backendKey:     "$(TF_ENV).terraform.tfstate"
+                    serviceConn:    "sc-azure-prod"
+                    kvName:         "kv-prod-myapp-xxxx"

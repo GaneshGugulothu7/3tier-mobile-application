@@ -1,0 +1,64 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# terraform.tfvars  –  Example values for the DEV environment
+# Copy this file to terraform.tfvars and fill in real values.
+# Never commit real secrets / IDs to version control.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Global ────────────────────────────────────────────────────────────────────
+subscription_id = "00000000-0000-0000-0000-000000000000"
+tenant_id       = "00000000-0000-0000-0000-000000000000"
+environment     = "dev"
+project         = "myapp"
+location        = "eastus"
+
+tags = {
+  owner      = "platform-team"
+  cost_center = "CC-1234"
+}
+
+# ── Networking ────────────────────────────────────────────────────────────────
+vnet_address_space = ["10.0.0.0/16"]
+subnet_app_prefix  = "10.0.1.0/24"
+subnet_db_prefix   = "10.0.2.0/24"
+subnet_apim_prefix = "10.0.3.0/24"
+
+# ── App Service ───────────────────────────────────────────────────────────────
+app_service_sku           = "P1v3"
+app_service_min_instances = 1
+app_service_max_instances = 3
+
+# ── Function App ──────────────────────────────────────────────────────────────
+function_app_sku         = "EP1"
+function_runtime         = "dotnet"
+function_runtime_version = "~4"
+
+# ── Cosmos DB ─────────────────────────────────────────────────────────────────
+cosmos_offer_type        = "Standard"
+cosmos_consistency_level = "Session"
+
+cosmos_databases = {
+  maindb = {
+    throughput = null   # use serverless or autoscale at container level
+    containers = {
+      orders = {
+        partition_key_path = "/customerId"
+        throughput         = null
+      }
+      events = {
+        partition_key_path = "/eventType"
+        throughput         = null
+      }
+    }
+  }
+}
+
+# ── APIM ──────────────────────────────────────────────────────────────────────
+apim_sku             = "Developer"
+apim_publisher_name  = "My Company"
+apim_publisher_email = "platform@mycompany.com"
+
+# ── Key Vault ─────────────────────────────────────────────────────────────────
+kv_soft_delete_retention_days = 7   # use 90 for prod
+
+# ── Monitoring ────────────────────────────────────────────────────────────────
+log_retention_days = 30

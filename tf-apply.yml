@@ -1,0 +1,71 @@
+# templates/tf-apply.yml
+# Reusable template: download plan artifact → terraform apply
+# ─────────────────────────────────────────────────────────────────────────────
+parameters:
+  - name: environment
+    type: string
+  - name: backendKey
+    type: string
+  - name: serviceConn
+    type: string
+  - name: kvName
+    type: string
+
+steps:
+  # ── Install Terraform ──────────────────────────────────────────────────────
+  - task: TerraformInstaller@1
+    displayName: "Install Terraform"
+    inputs:
+      terraformVersion: $(TF_VERSION)
+
+  # ── Fetch secrets from Key Vault ──────────────────────────────────────────
+  - task: AzureKeyVault@2
+    displayName: "Fetch secrets from Key Vault"
+    inputs:
+      azureSubscription: "${{ parameters.serviceConn }}"
+      KeyVaultName:       "${{ parameters.kvName }}"
+      SecretsFilter:      "subscription-id,tenant-id,apim-publisher-email"
+      RunAsPreJob:        false
+
+  # ── Download plan artifact ─────────────────────────────────────────────────
+  - task: DownloadPipelineArtifact@2
+    displayName: "Download Terraform Plan"
+    inputs:
+      artifact:     "tfplan-${{ parameters.environment }}"
+      targetPath:   "$(Pipeline.Workspace)/tfplan-${{ parameters.environment }}"
+
+  # ── Terraform Init (required before apply) ────────────────────────────────
+  - task: TerraformTaskV4@4
+    displayName: "Terraform Init"
+    inputs:
+      provider:              "azurerm"
+      command:               "init"
+      workingDirectory:      $(TF_WORKING_DIR)
+      backendServiceArm:     "${{ parameters.serviceConn }}"
+      backendAzureRmResourceGroupName:  $(BACKEND_RG)
+      backendAzureRmStorageAccountName: $(BACKEND_SA)
+      backendAzureRmContainerName:      $(BACKEND_CONTAINER)
+      backendAzureRmKey:                "${{ parameters.backendKey }}"
+
+  # ── Terraform Apply ───────────────────────────────────────────────────────
+  - task: TerraformTaskV4@4
+    displayName: "Terraform Apply"
+    inputs:
+      provider:            "azurerm"
+      command:             "apply"
+      workingDirectory:    $(TF_WORKING_DIR)
+      environmentServiceNameAzureRM: "${{ parameters.serviceConn }}"
+      commandOptions: >-
+        -auto-approve
+        -input=false
+        $(Pipeline.Workspace)/tfplan-${{ parameters.environment }}/tfplan-${{ parameters.environment }}
+
+  # ── Capture outputs ───────────────────────────────────────────────────────
+  - task: TerraformTaskV4@4
+    displayName: "Terraform Output"
+    inputs:
+      provider:         "azurerm"
+      command:          "output"
+      workingDirectory: $(TF_WORKING_DIR)
+      environmentServiceNameAzureRM: "${{ parameters.serviceConn }}"
+      commandOptions:   "-json"
