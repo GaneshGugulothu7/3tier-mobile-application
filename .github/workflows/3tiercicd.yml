@@ -8,21 +8,24 @@ jobs:
   terraform:
     runs-on: ubuntu-latest
 
-    defaults:
-      run:
-        working-directory: infra
-
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: hashicorp/setup-terraform@v3
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: 1.7.5
 
-      - run: terraform init
-      - run: terraform validate
-      - run: terraform plan -out=tfplan
+      - name: Terraform Init
+        run: terraform init
 
-      - name: Apply
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Plan
+        run: terraform plan -out=tfplan
+
+      - name: Terraform Apply
         if: github.ref == 'refs/heads/master'
         run: terraform apply -auto-approve tfplan
