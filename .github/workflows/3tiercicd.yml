@@ -1,211 +1,513 @@
-trigger:
-  branches:
-    include:
+name: Terraform CI/CD
+
+on:
+  push:
+    branches:
       - main
       - develop
-  paths:
-    include:
-      - infra/**
-
-pr:
-  branches:
-    include:
+    paths:
+      - 'infra/**'
+  pull_request:
+    branches:
       - main
       - develop
-  paths:
-    include:
-      - infra/**
+    paths:
+      - 'infra/**'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - test
+          - prod
+      run_apply:
+        description: 'Run terraform apply?'
+        required: true
+        default: 'false'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
 
-variables:
-  - group: terraform-global
-  - name: TF_VERSION
-    value: "1.7.5"
-  - name: TF_WORKING_DIR
-    value: "$(System.DefaultWorkingDirectory)/infra"
-  - name: BACKEND_RG
-    value: "rg-tfstate"
-  - name: BACKEND_SA
-    value: "stterraformstate001"
-  - name: BACKEND_CONTAINER
-    value: "tfstate"
+env:
+  TF_VERSION: "1.7.5"
+  TF_WORKING_DIR: "./infra"
+  BACKEND_RG: "rg-tfstate"
+  BACKEND_SA: "stterraformstate001"
+  BACKEND_CONTAINER: "tfstate"
 
-parameters:
-  - name: runProd
-    type: boolean
-    default: false
+# ═══════════════════════════════════════════════════════════════════════════════
+# JOB 1 – Lint & Security Scan
+# ═══════════════════════════════════════════════════════════════════════════════
+jobs:
+  lint:
+    name: "Lint & Security Scan"
+    runs-on: ubuntu-latest
 
-stages:
-
-# ─────────────────────────────────────────────
-# CI STAGE
-# ─────────────────────────────────────────────
-- stage: CI
-  jobs:
-
-  # LINT + SECURITY
-  - job: Lint
-    pool:
-      vmImage: ubuntu-latest
     steps:
-      - checkout: self
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - task: TerraformInstaller@1
-        inputs:
-          terraformVersion: $(TF_VERSION)
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
 
-      - script: |
+      - name: Install TFLint
+        run: |
           curl -s https://raw.githubusercontent.com/terraform-linters/tflint/master/install_linux.sh | bash
-          cd $(TF_WORKING_DIR)
+          tflint --version
+
+      - name: TFLint
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
           tflint --init
           tflint --recursive
 
-      - script: |
-          pip3 install checkov --quiet
-          checkov -d $(TF_WORKING_DIR) \
-            --framework terraform \
-            --output junitxml \
-            --output-file-path $(Build.ArtifactStagingDirectory)/checkov.xml \
-            --soft-fail
+      - name: Checkov Security Scan
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: ${{ env.TF_WORKING_DIR }}
+          framework: terraform
+          output_format: cli,sarif
+          output_file_path: console,results.sarif
+          soft_fail: true
 
-      - task: PublishTestResults@2
-        inputs:
-          testResultsFormat: JUnit
-          testResultsFiles: "$(Build.ArtifactStagingDirectory)/checkov.xml"
+      - name: Upload Checkov SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: results.sarif
 
-  # PLAN JOB TEMPLATE INLINE
-  - job: Plan_Dev
-    dependsOn: Lint
-    variables:
-      - group: terraform-dev
-      - name: TF_ENV
-        value: dev
-    pool:
-      vmImage: ubuntu-latest
-    steps:
-      - checkout: self
-
-      - task: TerraformInstaller@1
-        inputs:
-          terraformVersion: $(TF_VERSION)
-
-      - task: AzureKeyVault@2
-        inputs:
-          azureSubscription: "sc-azure-dev"
-          KeyVaultName: "kv-dev-myapp-xxxx"
-          SecretsFilter: "subscription-id,tenant-id,apim-publisher-email"
-
-      - task: TerraformTaskV4@4
-        inputs:
-          provider: azurerm
-          command: init
-          workingDirectory: $(TF_WORKING_DIR)
-          backendServiceArm: "sc-azure-dev"
-          backendAzureRmResourceGroupName: $(BACKEND_RG)
-          backendAzureRmStorageAccountName: $(BACKEND_SA)
-          backendAzureRmContainerName: $(BACKEND_CONTAINER)
-          backendAzureRmKey: "dev.terraform.tfstate"
-
-      - task: TerraformTaskV4@4
-        inputs:
-          provider: azurerm
-          command: plan
-          workingDirectory: $(TF_WORKING_DIR)
-          environmentServiceNameAzureRM: "sc-azure-dev"
-          commandOptions: >-
-            -var="environment=dev"
-            -var-file="dev.tfvars"
-            -out=$(Build.ArtifactStagingDirectory)/tfplan-dev
-
-      - task: PublishPipelineArtifact@1
-        inputs:
-          targetPath: "$(Build.ArtifactStagingDirectory)/tfplan-dev"
-          artifact: "tfplan-dev"
-
-# ─────────────────────────────────────────────
-# APPLY DEV
-# ─────────────────────────────────────────────
-- stage: Deploy_Dev
-  dependsOn: CI
-  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
-  jobs:
-  - deployment: Apply_Dev
+# ═══════════════════════════════════════════════════════════════════════════════
+# JOB 2 – Terraform Plan (dev)
+# ═══════════════════════════════════════════════════════════════════════════════
+  plan-dev:
+    name: "Plan – dev"
+    runs-on: ubuntu-latest
+    needs: lint
     environment: dev
-    pool:
-      vmImage: ubuntu-latest
-    strategy:
-      runOnce:
-        deploy:
-          steps:
-            - checkout: self
+    env:
+      TF_ENV: dev
 
-            - task: TerraformInstaller@1
-              inputs:
-                terraformVersion: $(TF_VERSION)
+    permissions:
+      id-token: write       # required for OIDC
+      contents: read
+      pull-requests: write  # to post plan output as PR comment
 
-            - task: DownloadPipelineArtifact@2
-              inputs:
-                artifact: "tfplan-dev"
-                targetPath: "$(Pipeline.Workspace)/tfplan-dev"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-            - task: TerraformTaskV4@4
-              inputs:
-                provider: azurerm
-                command: init
-                workingDirectory: $(TF_WORKING_DIR)
-                backendServiceArm: "sc-azure-dev"
-                backendAzureRmResourceGroupName: $(BACKEND_RG)
-                backendAzureRmStorageAccountName: $(BACKEND_SA)
-                backendAzureRmContainerName: $(BACKEND_CONTAINER)
-                backendAzureRmKey: "dev.terraform.tfstate"
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID_DEV }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID_DEV }}
 
-            - task: TerraformTaskV4@4
-              inputs:
-                provider: azurerm
-                command: apply
-                workingDirectory: $(TF_WORKING_DIR)
-                environmentServiceNameAzureRM: "sc-azure-dev"
-                commandOptions: >-
-                  -auto-approve
-                  $(Pipeline.Workspace)/tfplan-dev/tfplan-dev
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
 
-# ─────────────────────────────────────────────
-# APPLY TEST
-# ─────────────────────────────────────────────
-- stage: Deploy_Test
-  dependsOn: Deploy_Dev
-  jobs:
-  - deployment: Apply_Test
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ env.BACKEND_RG }}" \
+            -backend-config="storage_account_name=${{ env.BACKEND_SA }}" \
+            -backend-config="container_name=${{ env.BACKEND_CONTAINER }}" \
+            -backend-config="key=${{ env.TF_ENV }}.terraform.tfstate" \
+            -input=false
+        env:
+          ARM_USE_OIDC:        true
+          ARM_CLIENT_ID:       ${{ secrets.AZURE_CLIENT_ID_DEV }}
+          ARM_TENANT_ID:       ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID_DEV }}
+
+      - name: Terraform Validate
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform validate
+
+      - name: Terraform Plan
+        id: plan
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform plan \
+            -var-file="${{ env.TF_ENV }}.tfvars" \
+            -var="subscription_id=${{ secrets.AZURE_SUBSCRIPTION_ID_DEV }}" \
+            -var="tenant_id=${{ secrets.AZURE_TENANT_ID }}" \
+            -var="apim_publisher_email=${{ secrets.APIM_PUBLISHER_EMAIL }}" \
+            -out=tfplan-${{ env.TF_ENV }} \
+            -input=false \
+            -no-color 2>&1 | tee plan-output.txt
+        env:
+          ARM_USE_OIDC:        true
+          ARM_CLIENT_ID:       ${{ secrets.AZURE_CLIENT_ID_DEV }}
+          ARM_TENANT_ID:       ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID_DEV }}
+
+      - name: Post Plan as PR Comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('${{ env.TF_WORKING_DIR }}/plan-output.txt', 'utf8');
+            const truncated = plan.length > 60000 ? plan.substring(0, 60000) + '\n...(truncated)' : plan;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## Terraform Plan – \`dev\`\n\`\`\`hcl\n${truncated}\n\`\`\``
+            });
+
+      - name: Upload Plan Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-dev
+          path: ${{ env.TF_WORKING_DIR }}/tfplan-dev
+          retention-days: 5
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# JOB 3 – Terraform Plan (test)
+# ═══════════════════════════════════════════════════════════════════════════════
+  plan-test:
+    name: "Plan – test"
+    runs-on: ubuntu-latest
+    needs: lint
     environment: test
-    pool:
-      vmImage: ubuntu-latest
-    strategy:
-      runOnce:
-        deploy:
-          steps:
-            - checkout: self
+    env:
+      TF_ENV: test
 
-            - task: TerraformInstaller@1
-              inputs:
-                terraformVersion: $(TF_VERSION)
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: write
 
-            - task: DownloadPipelineArtifact@2
-              inputs:
-                artifact: "tfplan-test"
-                targetPath: "$(Pipeline.Workspace)/tfplan-test"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-# ─────────────────────────────────────────────
-# APPLY PROD
-# ─────────────────────────────────────────────
-- stage: Deploy_Prod
-  dependsOn: Deploy_Test
-  condition: eq('${{ parameters.runProd }}', true)
-  jobs:
-  - deployment: Apply_Prod
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID_TEST }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID_TEST }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ env.BACKEND_RG }}" \
+            -backend-config="storage_account_name=${{ env.BACKEND_SA }}" \
+            -backend-config="container_name=${{ env.BACKEND_CONTAINER }}" \
+            -backend-config="key=${{ env.TF_ENV }}.terraform.tfstate" \
+            -input=false
+        env:
+          ARM_USE_OIDC:        true
+          ARM_CLIENT_ID:       ${{ secrets.AZURE_CLIENT_ID_TEST }}
+          ARM_TENANT_ID:       ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID_TEST }}
+
+      - name: Terraform Validate
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform validate
+
+      - name: Terraform Plan
+        id: plan
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform plan \
+            -var-file="${{ env.TF_ENV }}.tfvars" \
+            -var="subscription_id=${{ secrets.AZURE_SUBSCRIPTION_ID_TEST }}" \
+            -var="tenant_id=${{ secrets.AZURE_TENANT_ID }}" \
+            -var="apim_publisher_email=${{ secrets.APIM_PUBLISHER_EMAIL }}" \
+            -out=tfplan-${{ env.TF_ENV }} \
+            -input=false \
+            -no-color
+        env:
+          ARM_USE_OIDC:        true
+          ARM_CLIENT_ID:       ${{ secrets.AZURE_CLIENT_ID_TEST }}
+          ARM_TENANT_ID:       ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID_TEST }}
+
+      - name: Upload Plan Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-test
+          path: ${{ env.TF_WORKING_DIR }}/tfplan-test
+          retention-days: 5
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# JOB 4 – Terraform Plan (prod)
+# ═══════════════════════════════════════════════════════════════════════════════
+  plan-prod:
+    name: "Plan – prod"
+    runs-on: ubuntu-latest
+    needs: lint
     environment: prod
-    pool:
-      vmImage: ubuntu-latest
-    strategy:
-      runOnce:
-        deploy:
-          steps:
-            - checkout: self
+    env:
+      TF_ENV: prod
+
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID_PROD }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID_PROD }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ env.BACKEND_RG }}" \
+            -backend-config="storage_account_name=${{ env.BACKEND_SA }}" \
+            -backend-config="container_name=${{ env.BACKEND_CONTAINER }}" \
+            -backend-config="key=${{ env.TF_ENV }}.terraform.tfstate" \
+            -input=false
+        env:
+          ARM_USE_OIDC:        true
+          ARM_CLIENT_ID:       ${{ secrets.AZURE_CLIENT_ID_PROD }}
+          ARM_TENANT_ID:       ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID_PROD }}
+
+      - name: Terraform Validate
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform validate
+
+      - name: Terraform Plan
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform plan \
+            -var-file="${{ env.TF_ENV }}.tfvars" \
+            -var="subscription_id=${{ secrets.AZURE_SUBSCRIPTION_ID_PROD }}" \
+            -var="tenant_id=${{ secrets.AZURE_TENANT_ID }}" \
+            -var="apim_publisher_email=${{ secrets.APIM_PUBLISHER_EMAIL }}" \
+            -out=tfplan-${{ env.TF_ENV }} \
+            -input=false \
+            -no-color
+        env:
+          ARM_USE_OIDC:        true
+          ARM_CLIENT_ID:       ${{ secrets.AZURE_CLIENT_ID_PROD }}
+          ARM_TENANT_ID:       ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID_PROD }}
+
+      - name: Upload Plan Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-prod
+          path: ${{ env.TF_WORKING_DIR }}/tfplan-prod
+          retention-days: 5
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# JOB 5 – Apply Dev (auto on push to main)
+# ═══════════════════════════════════════════════════════════════════════════════
+  apply-dev:
+    name: "Apply – dev"
+    runs-on: ubuntu-latest
+    needs: plan-dev
+    environment: dev                   # no protection rules = auto-approve
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    env:
+      TF_ENV: dev
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID_DEV }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID_DEV }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Download Plan Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-dev
+          path: ${{ env.TF_WORKING_DIR }}
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ env.BACKEND_RG }}" \
+            -backend-config="storage_account_name=${{ env.BACKEND_SA }}" \
+            -backend-config="container_name=${{ env.BACKEND_CONTAINER }}" \
+            -backend-config="key=${{ env.TF_ENV }}.terraform.tfstate" \
+            -input=false
+        env:
+          ARM_USE_OIDC:        true
+          ARM_CLIENT_ID:       ${{ secrets.AZURE_CLIENT_ID_DEV }}
+          ARM_TENANT_ID:       ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID_DEV }}
+
+      - name: Terraform Apply
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform apply -auto-approve -input=false tfplan-${{ env.TF_ENV }}
+        env:
+          ARM_USE_OIDC:        true
+          ARM_CLIENT_ID:       ${{ secrets.AZURE_CLIENT_ID_DEV }}
+          ARM_TENANT_ID:       ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID_DEV }}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# JOB 6 – Apply Test (requires manual approval in GitHub Environment)
+# ═══════════════════════════════════════════════════════════════════════════════
+  apply-test:
+    name: "Apply – test"
+    runs-on: ubuntu-latest
+    needs: apply-dev
+    environment: test                  # set Required Reviewers in GitHub → Environments
+    env:
+      TF_ENV: test
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID_TEST }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID_TEST }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Download Plan Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-test
+          path: ${{ env.TF_WORKING_DIR }}
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ env.BACKEND_RG }}" \
+            -backend-config="storage_account_name=${{ env.BACKEND_SA }}" \
+            -backend-config="container_name=${{ env.BACKEND_CONTAINER }}" \
+            -backend-config="key=${{ env.TF_ENV }}.terraform.tfstate" \
+            -input=false
+        env:
+          ARM_USE_OIDC:        true
+          ARM_CLIENT_ID:       ${{ secrets.AZURE_CLIENT_ID_TEST }}
+          ARM_TENANT_ID:       ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID_TEST }}
+
+      - name: Terraform Apply
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform apply -auto-approve -input=false tfplan-${{ env.TF_ENV }}
+        env:
+          ARM_USE_OIDC:        true
+          ARM_CLIENT_ID:       ${{ secrets.AZURE_CLIENT_ID_TEST }}
+          ARM_TENANT_ID:       ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID_TEST }}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# JOB 7 – Apply Prod (requires manual approval + workflow_dispatch gate)
+# ═══════════════════════════════════════════════════════════════════════════════
+  apply-prod:
+    name: "Apply – prod"
+    runs-on: ubuntu-latest
+    needs: apply-test
+    environment: prod                  # set Required Reviewers in GitHub → Environments
+    if: |
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.run_apply == 'true' && github.event.inputs.environment == 'prod')
+    env:
+      TF_ENV: prod
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID_PROD }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID_PROD }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Download Plan Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-prod
+          path: ${{ env.TF_WORKING_DIR }}
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ env.BACKEND_RG }}" \
+            -backend-config="storage_account_name=${{ env.BACKEND_SA }}" \
+            -backend-config="container_name=${{ env.BACKEND_CONTAINER }}" \
+            -backend-config="key=${{ env.TF_ENV }}.terraform.tfstate" \
+            -input=false
+        env:
+          ARM_USE_OIDC:        true
+          ARM_CLIENT_ID:       ${{ secrets.AZURE_CLIENT_ID_PROD }}
+          ARM_TENANT_ID:       ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID_PROD }}
+
+      - name: Terraform Apply
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform apply -auto-approve -input=false tfplan-${{ env.TF_ENV }}
+        env:
+          ARM_USE_OIDC:        true
+          ARM_CLIENT_ID:       ${{ secrets.AZURE_CLIENT_ID_PROD }}
+          ARM_TENANT_ID:       ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID_PROD }}
